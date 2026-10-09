@@ -20,6 +20,7 @@ from itertools import zip_longest
 
 from marshmallow import class_registry, types
 from marshmallow import fields as ma_fields
+from marshmallow import object_graph as _graph
 from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
@@ -31,6 +32,13 @@ from marshmallow.decorators import (
 )
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.object_graph import (
+    MSG_DUPLICATE_ID,
+    MSG_ID_AND_REFERENCE,
+    MSG_INVALID_ID,
+    MSG_INVALID_REFERENCE,
+    _GraphReferenceError,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -220,6 +228,29 @@ class SchemaOpts:
         self.unknown = getattr(meta, "unknown", RAISE)
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
+        self.object_graph = getattr(meta, "object_graph", False)
+        if not isinstance(self.object_graph, bool):
+            raise ValueError("`object_graph` option must be a boolean.")
+        self.object_graph_id_key = getattr(
+            meta, "object_graph_id_key", _graph.DEFAULT_ID_KEY
+        )
+        self.object_graph_ref_key = getattr(
+            meta, "object_graph_ref_key", _graph.DEFAULT_REF_KEY
+        )
+        if not isinstance(self.object_graph_id_key, str) or not isinstance(
+            self.object_graph_ref_key, str
+        ):
+            raise ValueError(
+                "`object_graph_id_key` and `object_graph_ref_key` must be strings."
+            )
+        if not self.object_graph_id_key or not self.object_graph_ref_key:
+            raise ValueError(
+                "`object_graph_id_key` and `object_graph_ref_key` must not be empty."
+            )
+        if self.object_graph_id_key == self.object_graph_ref_key:
+            raise ValueError(
+                "`object_graph_id_key` and `object_graph_ref_key` must be different."
+            )
 
 
 class Schema(metaclass=SchemaMeta):
@@ -268,6 +299,12 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param object_graph: If `True`, (de)serialize as an object graph instead
+        of a tree: objects reached through ``Nested`` fields are identified the
+        first time they are encountered and referenced by identity afterwards,
+        which supports circular references and shared objects. Can also be
+        enabled per call through `dump`/`load` or via the ``object_graph``
+        `class Meta <marshmallow.Schema.Meta>` option.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
@@ -404,6 +441,20 @@ class Schema(metaclass=SchemaMeta):
         by class name in `Nested` fields. Only set this to `False` when memory
         usage is critical. Defaults to `True`.
         """
+        object_graph: typing.ClassVar[bool]
+        """Whether to (de)serialize as an object graph by default, emitting
+        identifier/reference markers for repeated objects and rebuilding shared
+        object identity when loading. Defaults to `False`, which preserves the
+        default tree behavior.
+        """
+        object_graph_id_key: typing.ClassVar[str]
+        """Key under which an object's identifier is emitted. Defaults to
+        ``"$id"``.
+        """
+        object_graph_ref_key: typing.ClassVar[str]
+        """Key under which a reference to another object is emitted. Defaults to
+        ``"$ref"``.
+        """
 
     def __init__(
         self,
@@ -415,6 +466,7 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        object_graph: bool | None = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -424,6 +476,9 @@ class Schema(metaclass=SchemaMeta):
         # copy declared fields from metaclass
         self.declared_fields = copy.deepcopy(self._declared_fields)
         self.many = self.opts.many if many is None else many
+        self.object_graph = (
+            self.opts.object_graph if object_graph is None else bool(object_graph)
+        )
         self.only = only
         self.exclude: set[typing.Any] | typing.MutableSet[typing.Any] = set(
             self.opts.exclude
@@ -537,21 +592,49 @@ class Schema(metaclass=SchemaMeta):
         if many and obj is not None:
             return [self._serialize(d, many=False) for d in obj]
         ret = self.dict_class()
+        state = _graph.active_dump()
+        graph_id: str | None = None
+        if state is not None and obj is not None:
+            existing_id = state.seen_id(obj)
+            if existing_id is not None:
+                # Object already serialized in this operation: emit a
+                # reference instead of traversing it again (handles cycles
+                # and shared objects).
+                reference = self.dict_class()
+                reference[state.ref_key] = existing_id
+                return reference
+            # Register before serializing members so a reference leading back
+            # to this object terminates the traversal.
+            graph_id = state.register(obj)
         for attr_name, field_obj in self.dump_fields.items():
             value = field_obj.serialize(attr_name, obj, accessor=self.get_attribute)
             if value is missing:
                 continue
             key = field_obj.data_key if field_obj.data_key is not None else attr_name
             ret[key] = value
+        if graph_id is not None and state is not None:
+            marked = self.dict_class()
+            marked[state.id_key] = graph_id
+            marked.update(ret)
+            return marked
         return ret
 
-    def dump(self, obj: typing.Any, *, many: bool | None = None):
+    def dump(
+        self,
+        obj: typing.Any,
+        *,
+        many: bool | None = None,
+        object_graph: bool | None = None,
+    ):
         """Serialize an object to native Python data types according to this
         Schema's fields.
 
         :param obj: The object to serialize.
         :param many: Whether to serialize `obj` as a collection. If `None`, the value
             for `self.many` is used.
+        :param object_graph: Whether to serialize as an object graph, tracking
+            object identity to support circular references and shared objects.
+            If `None`, the schema's configured value is used.
         :return: Serialized data
 
         .. versionchanged:: 3.0.0b7
@@ -562,23 +645,34 @@ class Schema(metaclass=SchemaMeta):
             Validation no longer occurs upon serialization.
         """
         many = self.many if many is None else bool(many)
-        if self._hooks[PRE_DUMP]:
-            processed_obj = self._invoke_dump_processors(
-                PRE_DUMP, obj, many=many, original_data=obj
-            )
-        else:
-            processed_obj = obj
+        _state, token = _graph.enter(self, object_graph=object_graph, for_load=False)
+        try:
+            if self._hooks[PRE_DUMP]:
+                processed_obj = self._invoke_dump_processors(
+                    PRE_DUMP, obj, many=many, original_data=obj
+                )
+            else:
+                processed_obj = obj
 
-        result = self._serialize(processed_obj, many=many)
+            result = self._serialize(processed_obj, many=many)
 
-        if self._hooks[POST_DUMP]:
-            result = self._invoke_dump_processors(
-                POST_DUMP, result, many=many, original_data=obj
-            )
+            if self._hooks[POST_DUMP]:
+                result = self._invoke_dump_processors(
+                    POST_DUMP, result, many=many, original_data=obj
+                )
 
-        return result
+            return result
+        finally:
+            _graph.exit_(token)
 
-    def dumps(self, obj: typing.Any, *args, many: bool | None = None, **kwargs):
+    def dumps(
+        self,
+        obj: typing.Any,
+        *args,
+        many: bool | None = None,
+        object_graph: bool | None = None,
+        **kwargs,
+    ):
         """Same as :meth:`dump`, except return a JSON-encoded string.
 
         :param obj: The object to serialize.
@@ -591,7 +685,7 @@ class Schema(metaclass=SchemaMeta):
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if ``obj`` is invalid.
         """
-        serialized = self.dump(obj, many=many)
+        serialized = self.dump(obj, many=many, object_graph=object_graph)
         return self.opts.render_module.dumps(serialized, *args, **kwargs)
 
     def _deserialize(
@@ -621,28 +715,32 @@ class Schema(metaclass=SchemaMeta):
         instances if `many` is `True`.
         """
         index = index if self.opts.index_errors else None
+        state = _graph.active_load()
         if many:
-            if not is_sequence_but_not_string(data):
-                error_store.store_error([self.error_messages["type"]], index=index)
-                ret_l = []
-            else:
-                ret_l = [
-                    self._deserialize(
-                        d,
-                        error_store=error_store,
-                        many=False,
-                        partial=partial,
-                        unknown=unknown,
-                        index=idx,
-                    )
-                    for idx, d in enumerate(data)
-                ]
-            return ret_l
+            return self._deserialize_many(
+                data,
+                error_store=error_store,
+                partial=partial,
+                unknown=unknown,
+                index=index,
+                state=state,
+            )
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
+            reserved_keys: set[str] = set()
+            if state is not None:
+                ret_d, reserved_keys, reference_obj = self._graph_prepare_object(
+                    data,
+                    state=state,
+                    error_store=error_store,
+                    index=index,
+                    ret_d=ret_d,
+                )
+                if reference_obj is not None:
+                    raise _GraphReferenceError(reference_obj)
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
                 field_name = (
@@ -677,13 +775,19 @@ class Schema(metaclass=SchemaMeta):
                         **d_kwargs,
                     )
 
-                value = self._call_and_store(
-                    getter_func=getter,
-                    data=raw_value,
-                    field_name=field_name,
-                    error_store=error_store,
-                    index=index,
-                )
+                if state is not None:
+                    state.push_path(field_name)
+                try:
+                    value = self._call_and_store(
+                        getter_func=getter,
+                        data=raw_value,
+                        field_name=field_name,
+                        error_store=error_store,
+                        index=index,
+                    )
+                finally:
+                    if state is not None:
+                        state.pop_path()
                 if value is not missing:
                     key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
@@ -692,7 +796,9 @@ class Schema(metaclass=SchemaMeta):
                     field_obj.data_key if field_obj.data_key is not None else field_name
                     for field_name, field_obj in self.load_fields.items()
                 }
-                for key in set(data) - fields:
+                # Identifier/reference markers are graph metadata, never
+                # unknown user fields.
+                for key in set(data) - fields - reserved_keys:
                     value = data[key]
                     if unknown == INCLUDE:
                         ret_d[key] = value
@@ -704,6 +810,94 @@ class Schema(metaclass=SchemaMeta):
                         )
         return ret_d
 
+    def _deserialize_many(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        error_store: ErrorStore,
+        partial,
+        unknown: types.UnknownOption,
+        index,
+        state: _graph._GraphLoadState | None,
+    ) -> list[typing.Any]:
+        """Deserialize a collection of objects, tracking collection indexes
+        in the graph path so deferred reference errors are reported at the
+        right location."""
+        if not is_sequence_but_not_string(data):
+            error_store.store_error([self.error_messages["type"]], index=index)
+            return []
+        ret_l: list[typing.Any] = []
+        for idx, d in enumerate(data):
+            if state is not None and self.opts.index_errors:
+                state.push_path(idx)
+            try:
+                try:
+                    item = self._deserialize(
+                        d,
+                        error_store=error_store,
+                        many=False,
+                        partial=partial,
+                        unknown=unknown,
+                        index=idx,
+                    )
+                except _GraphReferenceError as reference:
+                    # Reference-only collection item: reuse the shared
+                    # instance instead of building a new object.
+                    item = reference.obj
+            finally:
+                if state is not None and self.opts.index_errors:
+                    state.pop_path()
+            ret_l.append(item)
+        return ret_l
+
+    def _graph_prepare_object(
+        self,
+        data: Mapping[str, typing.Any],
+        *,
+        state: _graph._GraphLoadState,
+        error_store: ErrorStore,
+        index,
+        ret_d,
+    ) -> tuple[typing.Any, set[str], typing.Any]:
+        """Inspect object graph markers in ``data`` before field processing.
+
+        Returns ``(ret_d, reserved_keys, reference_obj)``. ``reference_obj``
+        is set when ``data`` is a pure reference marker, in which case the
+        caller short-circuits and returns the shared instance.
+        """
+        id_key = state.id_key
+        ref_key = state.ref_key
+        has_id = id_key in data
+        has_ref = ref_key in data
+        if not has_id and not has_ref:
+            return ret_d, set(), None
+        reserved_keys = {id_key, ref_key}
+        reference_obj: typing.Any = None
+        if has_id and has_ref:
+            error_store.store_error([MSG_ID_AND_REFERENCE], ref_key, index=index)
+        elif has_ref:
+            ref_value = data[ref_key]
+            if not isinstance(ref_value, str) or len(data) > 1:
+                error_store.store_error([MSG_INVALID_REFERENCE], ref_key, index=index)
+            else:
+                reference_obj = state.resolve(ref_value, self.dict_class)
+        else:
+            graph_id = data[id_key]
+            if not isinstance(graph_id, str):
+                error_store.store_error([MSG_INVALID_ID], id_key, index=index)
+            elif graph_id in state.defined:
+                error_store.store_error(
+                    [MSG_DUPLICATE_ID.format(id=graph_id)], id_key, index=index
+                )
+            else:
+                instance = state.instances.get(graph_id)
+                if instance is None:
+                    instance = self.dict_class()
+                    state.instances[graph_id] = instance
+                state.defined.add(graph_id)
+                ret_d = instance
+        return ret_d, reserved_keys, reference_obj
+
     def load(
         self,
         data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
@@ -711,6 +905,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        object_graph: bool | None = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -724,6 +919,9 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param object_graph: Whether to deserialize an object graph, rebuilding
+            circular references and shared object identity from identifier and
+            reference markers. If `None`, the schema's configured value is used.
         :return: Deserialized data
 
         .. versionchanged:: 3.0.0b7
@@ -732,7 +930,12 @@ class Schema(metaclass=SchemaMeta):
             if invalid data are passed.
         """
         return self._do_load(
-            data, many=many, partial=partial, unknown=unknown, postprocess=True
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            postprocess=True,
+            object_graph=object_graph,
         )
 
     def loads(
@@ -743,6 +946,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        object_graph: bool | None = None,
         **kwargs,
     ):
         """Same as :meth:`load`, except it uses `marshmallow.Schema.Meta.render_module` to deserialize
@@ -768,7 +972,13 @@ class Schema(metaclass=SchemaMeta):
             Rename ``json_module`` parameter to ``s``.
         """
         data = self.opts.render_module.loads(s, **kwargs)
-        return self.load(data, many=many, partial=partial, unknown=unknown)
+        return self.load(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            object_graph=object_graph,
+        )
 
     def _run_validator(
         self,
@@ -818,6 +1028,7 @@ class Schema(metaclass=SchemaMeta):
         *,
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
+        object_graph: bool | None = None,
     ) -> dict[str, list[str]]:
         """Validate `data` against the schema, returning a dictionary of
         validation errors.
@@ -829,10 +1040,19 @@ class Schema(metaclass=SchemaMeta):
             any fields declared. Propagates down to ``Nested`` fields as well. If
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
+        :param object_graph: Whether to validate an object graph, enforcing the
+            same identifier and reference rules as `load`. If `None`, the
+            schema's configured value is used.
         :return: A dictionary of validation errors.
         """
         try:
-            self._do_load(data, many=many, partial=partial, postprocess=False)
+            self._do_load(
+                data,
+                many=many,
+                partial=partial,
+                postprocess=False,
+                object_graph=object_graph,
+            )
         except ValidationError as exc:
             return typing.cast("dict[str, list[str]]", exc.messages)
         return {}
@@ -847,6 +1067,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        object_graph: bool | None = None,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -862,6 +1083,7 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
         :param postprocess: Whether to run post_load methods.
+        :param object_graph: Whether to deserialize as an object graph.
         :return: Deserialized data
         """
         error_store = ErrorStore()
@@ -870,65 +1092,14 @@ class Schema(metaclass=SchemaMeta):
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
-        # Run preprocessors
-        if self._hooks[PRE_LOAD]:
-            try:
-                processed_data = self._invoke_load_processors(
-                    PRE_LOAD,
-                    data,
-                    many=many,
-                    original_data=data,
-                    partial=partial,
-                    unknown=unknown,
-                )
-            except ValidationError as err:
-                errors = err.normalized_messages()
-                result: list | dict | None = None
-        else:
-            processed_data = data
-        if not errors:
-            # Deserialize data
-            result = self._deserialize(
-                processed_data,
-                error_store=error_store,
-                many=many,
-                partial=partial,
-                unknown=unknown,
-            )
-            # Run field-level validation
-            self._invoke_field_validators(
-                error_store=error_store, data=result, many=many
-            )
-            # Run schema-level validation
-            if self._hooks[VALIDATES_SCHEMA]:
-                field_errors = bool(error_store.errors)
-                self._invoke_schema_validators(
-                    error_store=error_store,
-                    pass_collection=True,
-                    data=result,
-                    original_data=data,
-                    many=many,
-                    partial=partial,
-                    unknown=unknown,
-                    field_errors=field_errors,
-                )
-                self._invoke_schema_validators(
-                    error_store=error_store,
-                    pass_collection=False,
-                    data=result,
-                    original_data=data,
-                    many=many,
-                    partial=partial,
-                    unknown=unknown,
-                    field_errors=field_errors,
-                )
-            errors = error_store.errors
-            # Run post processors
-            if not errors and postprocess and self._hooks[POST_LOAD]:
+        state, token = _graph.enter(self, object_graph=object_graph, for_load=True)
+        try:
+            # Run preprocessors
+            if self._hooks[PRE_LOAD]:
                 try:
-                    result = self._invoke_load_processors(
-                        POST_LOAD,
-                        result,
+                    processed_data = self._invoke_load_processors(
+                        PRE_LOAD,
+                        data,
                         many=many,
                         original_data=data,
                         partial=partial,
@@ -936,12 +1107,87 @@ class Schema(metaclass=SchemaMeta):
                     )
                 except ValidationError as err:
                     errors = err.normalized_messages()
-        if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
-            self.handle_error(exc, data, many=many, partial=partial)
-            raise exc
+                    result: list | dict | None = None
+            else:
+                processed_data = data
+            if not errors:
+                # Deserialize data
+                try:
+                    result = self._deserialize(
+                        processed_data,
+                        error_store=error_store,
+                        many=many,
+                        partial=partial,
+                        unknown=unknown,
+                    )
+                    is_reference = False
+                except _GraphReferenceError as reference:
+                    # The whole (non-collection) object is a reference marker:
+                    # reuse the shared instance and skip validation/hooks,
+                    # which run for the object's definition instead.
+                    result = reference.obj
+                    is_reference = True
+                # Only the operation that owns the graph can finalize it:
+                # nested schemas may have forward references that a later
+                # sibling still defines.
+                if token is not None and state is not None:
+                    for messages in state.dangling_messages():
+                        error_store.store_error(messages)
+                if not is_reference:
+                    # Run field-level validation
+                    self._invoke_field_validators(
+                        error_store=error_store, data=result, many=many
+                    )
+                    # Run schema-level validation
+                    if self._hooks[VALIDATES_SCHEMA]:
+                        field_errors = bool(error_store.errors)
+                        self._invoke_schema_validators(
+                            error_store=error_store,
+                            pass_collection=True,
+                            data=result,
+                            original_data=data,
+                            many=many,
+                            partial=partial,
+                            unknown=unknown,
+                            field_errors=field_errors,
+                        )
+                        self._invoke_schema_validators(
+                            error_store=error_store,
+                            pass_collection=False,
+                            data=result,
+                            original_data=data,
+                            many=many,
+                            partial=partial,
+                            unknown=unknown,
+                            field_errors=field_errors,
+                        )
+                errors = error_store.errors
+                # Run post processors
+                if (
+                    not errors
+                    and postprocess
+                    and self._hooks[POST_LOAD]
+                    and not is_reference
+                ):
+                    try:
+                        result = self._invoke_load_processors(
+                            POST_LOAD,
+                            result,
+                            many=many,
+                            original_data=data,
+                            partial=partial,
+                            unknown=unknown,
+                        )
+                    except ValidationError as err:
+                        errors = err.normalized_messages()
+            if errors:
+                exc = ValidationError(errors, data=data, valid_data=result)
+                self.handle_error(exc, data, many=many, partial=partial)
+                raise exc
 
-        return result
+            return result
+        finally:
+            _graph.exit_(token)
 
     def _normalize_nested_options(self) -> None:
         """Apply then flatten nested schema options.
@@ -1051,6 +1297,27 @@ class Schema(metaclass=SchemaMeta):
         self.fields = fields_dict
         self.dump_fields = dump_fields
         self.load_fields = load_fields
+
+        if self.object_graph:
+            reserved = {
+                self.opts.object_graph_id_key,
+                self.opts.object_graph_ref_key,
+            }
+            external_keys = {
+                field_obj.data_key if field_obj.data_key is not None else name
+                for name, field_obj in {
+                    **self.dump_fields,
+                    **self.load_fields,
+                }.items()
+            }
+            collisions = external_keys & reserved
+            if collisions:
+                raise ValueError(
+                    "Object graph mode reserves the field key(s) "
+                    f"{sorted(collisions)!r}, which collide with declared fields "
+                    f"of {self!r}. Rename the conflicting fields or configure "
+                    "different object_graph_id_key/object_graph_ref_key keys."
+                )
 
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.

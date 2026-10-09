@@ -29,12 +29,14 @@ else:
     MonkeyPatch.patch_fromisoformat()
 
 from marshmallow import class_registry, types, utils, validate
+from marshmallow import object_graph as _graph
 from marshmallow.constants import missing as missing_
 from marshmallow.exceptions import (
     StringNotCollectionError,
     ValidationError,
     _FieldInstanceResolutionError,
 )
+from marshmallow.object_graph import MSG_ILLEGAL_POSITION
 from marshmallow.validate import And, Length
 
 if typing.TYPE_CHECKING:
@@ -382,6 +384,18 @@ class Field(typing.Generic[_InternalT]):
             _miss = self.load_default
             return _miss() if callable(_miss) else _miss
 
+        # In object graph mode identifier/reference markers are only legal
+        # at Nested (object) positions. A marker reaching any other field is
+        # an illegal reference position and fails atomically.
+        graph_state = _graph.active()
+        if (
+            graph_state is not None
+            and not isinstance(self, Nested)
+            and isinstance(value, _Mapping)
+            and (graph_state.ref_key in value or graph_state.id_key in value)
+        ):
+            raise ValidationError(MSG_ILLEGAL_POSITION)
+
         # Apply pre_load functions
         for func in self.pre_load:
             value = func(value)
@@ -713,7 +727,13 @@ class Pluck(Nested):
         return only_field.data_key or self.field_name
 
     def _serialize(self, nested_obj, attr, obj, **kwargs):
-        ret = super()._serialize(nested_obj, attr, obj, **kwargs)
+        # Pluck collapses objects down to a single scalar field, which cannot
+        # carry object graph markers: traverse this subtree as a tree.
+        token = _graph.suspend()
+        try:
+            ret = super()._serialize(nested_obj, attr, obj, **kwargs)
+        finally:
+            _graph.resume(token)
         if ret is None:
             return None
         if self.many:
@@ -783,13 +803,19 @@ class List(Field[list[_InternalT | None]]):
 
         result = []
         errors = {}
+        state = _graph.active()
         for idx, each in enumerate(value):
+            if state is not None:
+                state.push_path(idx)
             try:
                 result.append(self.inner.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
                 errors.update({idx: error.messages})
+            finally:
+                if state is not None:
+                    state.pop_path()
         if errors:
             raise ValidationError(errors, valid_data=result)
         return result
@@ -877,14 +903,20 @@ class Tuple(Field[tuple]):
 
         result = []
         errors = {}
+        state = _graph.active()
 
         for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
+            if state is not None:
+                state.push_path(idx)
             try:
                 result.append(field.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(error.valid_data)
                 errors.update({idx: error.messages})
+            finally:
+                if state is not None:
+                    state.pop_path()
         if errors:
             raise ValidationError(errors, valid_data=result)
 
@@ -1706,12 +1738,15 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
 
         # Deserialize values
         result = self.mapping_type()
+        state = _graph.active()
         if self.value_field is None:
             for k, v in value.items():
                 if k in keys:
                     result[keys[k]] = v
         else:
             for key, val in value.items():
+                if state is not None:
+                    state.push_path(key)
                 try:
                     deser_val = self.value_field.deserialize(val, **kwargs)
                 except ValidationError as error:
@@ -1721,6 +1756,9 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                 else:
                     if key in keys:
                         result[keys[key]] = deser_val
+                finally:
+                    if state is not None:
+                        state.pop_path()
 
         if errors:
             raise ValidationError(errors, valid_data=result)
